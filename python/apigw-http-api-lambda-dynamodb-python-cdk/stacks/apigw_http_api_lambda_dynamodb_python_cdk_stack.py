@@ -12,6 +12,8 @@ from aws_cdk import (
     aws_logs as logs,
     aws_cloudtrail as cloudtrail,
     aws_s3 as s3,
+    aws_cloudwatch as cloudwatch,
+    aws_synthetics as synthetics,
     Duration,
     RemovalPolicy,
 )
@@ -51,7 +53,7 @@ class ApigwHttpApiLambdaDynamodbPythonCdkStack(Stack):
             traffic_type=ec2.FlowLogTrafficType.ALL,
         )
         
-        # Create VPC endpoint
+        # Create VPC endpoint for DynamoDB
         dynamo_db_endpoint = ec2.GatewayVpcEndpoint(
             self,
             "DynamoDBVpce",
@@ -76,6 +78,15 @@ class ApigwHttpApiLambdaDynamodbPythonCdkStack(Stack):
             )
         )
 
+        # Create VPC endpoint for X-Ray (required for Lambda in isolated subnets)
+        ec2.InterfaceVpcEndpoint(
+            self,
+            "XRayVpce",
+            vpc=vpc,
+            service=ec2.InterfaceVpcEndpointAwsService.XRAY,
+            subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
+        )
+
         # Create DynamoDb Table with Point-in-Time Recovery
         demo_table = dynamodb_.Table(
             self,
@@ -86,7 +97,7 @@ class ApigwHttpApiLambdaDynamodbPythonCdkStack(Stack):
             point_in_time_recovery=True,
         )
 
-        # Create the Lambda function to receive the request
+        # Create the Lambda function to receive the request with X-Ray tracing
         api_hanlder = lambda_.Function(
             self,
             "ApiHandler",
@@ -101,6 +112,7 @@ class ApigwHttpApiLambdaDynamodbPythonCdkStack(Stack):
             memory_size=1024,
             timeout=Duration.minutes(5),
             log_retention=logs.RetentionDays.ONE_YEAR,
+            tracing=lambda_.Tracing.ACTIVE,
         )
 
         # grant permission to lambda to write to demo table
@@ -115,8 +127,8 @@ class ApigwHttpApiLambdaDynamodbPythonCdkStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,
         )
 
-        # Create API Gateway with access logging
-        apigw_.LambdaRestApi(
+        # Create API Gateway with access logging and X-Ray tracing
+        api = apigw_.LambdaRestApi(
             self,
             "Endpoint",
             handler=api_hanlder,
@@ -133,7 +145,103 @@ class ApigwHttpApiLambdaDynamodbPythonCdkStack(Stack):
                     status=True,
                     user=True,
                 ),
+                tracing_enabled=True,
             ),
+        )
+
+        # CloudWatch Alarm for Lambda errors
+        cloudwatch.Alarm(
+            self,
+            "LambdaErrorAlarm",
+            metric=api_hanlder.metric_errors(),
+            threshold=1,
+            evaluation_periods=1,
+            alarm_description="Alert when Lambda function errors occur",
+        )
+
+        # CloudWatch Alarm for API Gateway 5xx errors
+        cloudwatch.Alarm(
+            self,
+            "ApiGateway5xxAlarm",
+            metric=api.metric_server_error(),
+            threshold=5,
+            evaluation_periods=2,
+            alarm_description="Alert when API Gateway 5xx errors occur",
+        )
+
+        # CloudWatch Alarm for API Gateway 4xx errors
+        cloudwatch.Alarm(
+            self,
+            "ApiGateway4xxAlarm",
+            metric=api.metric_client_error(),
+            threshold=10,
+            evaluation_periods=2,
+            alarm_description="Alert when API Gateway 4xx errors exceed threshold",
+        )
+
+        # S3 bucket for Canary artifacts
+        canary_bucket = s3.Bucket(
+            self,
+            "CanaryArtifactsBucket",
+            encryption=s3.BucketEncryption.S3_MANAGED,
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
+        )
+
+        # CloudWatch Synthetic Canary to monitor API endpoint
+        canary = synthetics.Canary(
+            self,
+            "ApiCanary",
+            runtime=synthetics.Runtime.SYNTHETICS_PYTHON_SELENIUM_3_0,
+            test=synthetics.Test.custom(
+                code=synthetics.Code.from_inline(f"""
+import json
+from aws_synthetics.selenium import synthetics_webdriver as webdriver
+from aws_synthetics.common import synthetics_logger as logger
+from aws_synthetics.common import synthetics_configuration
+
+def handler(event, context):
+    logger.info("Starting canary test")
+    url = "{api.url}"
+    
+    # Configure synthetics
+    synthetics_configuration.set_config({{
+        "screenshot_on_step_start": False,
+        "screenshot_on_step_success": False,
+        "screenshot_on_step_failure": True
+    }})
+    
+    browser = webdriver.Chrome()
+    browser.set_page_load_timeout(30)
+    
+    try:
+        browser.get(url)
+        logger.info(f"Successfully loaded {{url}}")
+        logger.info(f"Response status: {{browser.title}}")
+    finally:
+        browser.quit()
+    
+    logger.info("Canary test completed successfully")
+    return {{"statusCode": 200}}
+                """),
+                handler="handler",
+            ),
+            artifacts_bucket_location=synthetics.ArtifactsBucketLocation(
+                bucket=canary_bucket
+            ),
+            schedule=synthetics.Schedule.rate(Duration.minutes(5)),
+            enable_auto_start=True,
+        )
+
+        # CloudWatch Alarm for Canary failures
+        cloudwatch.Alarm(
+            self,
+            "CanaryFailureAlarm",
+            metric=canary.metric_failed(),
+            threshold=1,
+            evaluation_periods=1,
+            alarm_description="Alert when synthetic canary fails",
         )
 
         # Create S3 bucket for CloudTrail logs
